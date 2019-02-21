@@ -1,5 +1,7 @@
 # Project Ubin Phase 2 - Quorum
 
+This is a mirror push of https://github.com/project-ubin/ubin-quorum modified by project BLOCKTEST.
+
 This repository contains the source code and test scripts for the Quorum prototype in Project Ubin Phase 2.
 
 Ubin Phase 2 is a collaborative design and rapid prototyping project, exploring the use of Distributed Ledger Technologies (DLT) for Real-Time Gross Settlement. 
