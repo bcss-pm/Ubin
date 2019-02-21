@@ -1,0 +1,739 @@
+#!/bin/bash
+
+# check for uninitialised shell variables
+set -u
+
+# Requires jot command from "sudo apt install athena-jot"
+#
+# The configuration parameters are:
+# coordinator: the index of the coordinator in the various arrays (usually 1)
+# deployment: the index of the deployment node in the various arrays (usually 11)
+# nodeJoins: the number of nodes that must have joined the coordinator to complete the start.
+# nodeNumbers: the indices of all the nodes, starting at 1.
+# nodeNames: an array with the node names, indexed from 1.
+# nodeIPhigh: the three higher order bytes of the IP address range of the nodes.
+# nodeIPlow: an array with the low order byte of the IP addresses of the nodes, indexed from 1.
+# machNames: an array with the names of the machines running the nodes, indexed from 1.
+# backupDir: the name of the directory for backups.
+# userName: the name of the user running the nodes.
+# domain: the domain of the nodes.
+# bastionHost: the machine + domain name of the bastion host.
+
+# setup the configuration for a small network of 5 nodes
+function do_small {
+    coordinator=1
+    deployment=5
+    nodeJoins=3
+    nodeNumbers=`seq 1 5`
+    nodeNames=( `jot -w nx%02d 6 0` )
+    nodeIPhigh=192.168.9
+    nodeIPlow=( `jot 6 135` )
+    machNames=( `jot -w quorumnx%02d 6 0` )
+    backupDir=ubinBackup_small
+    deploymentDir=""
+    workDir=""
+    userName="sebtno"
+    domain="southeastasia.cloudapp.azure.com"
+    bastionHost="???"
+}
+
+# setup the configuration for a medium size network of 11 nodes
+function do_medium_tudelft {
+    coordinator=1
+    deployment=11
+    nodeJoins=12
+    nodeNumbers=`seq 1 14`
+    nodeNames=( unused nx01 nx02 nx03 nx04 nx05 nx06 nx07 nx08 nx09 nx10 nx11 nx12 nx15 nx14 )
+    nodeIPhigh=131.180.178
+    nodeIPlow=( `jot 15 20` )
+    machNames=( `jot -w ubin%02d 15 0` )
+    backupDir=ubinBackup_medium_tudelft
+    deploymentDir=""
+    workDir=""
+    userName="phartel"
+    domain="ewi.tudelft.nl"
+    bastionHost="linux-bastion.tudelft.nl"
+}
+
+# setup the configuration for a medium size network of 11 nodes on the NCL
+function do_medium_ncl {
+    coordinator=1
+    deployment=11
+    nodeJoins=12
+    nodeNumbers=`seq 1 14`
+    nodeNames=( unused n1 n2 n3 n4 n5 n6 n7 n8 n9 n10 n11 n12 n13 n14 )
+    nodeIPhigh=172.16.1
+    nodeIPlow=( ??? )
+    machNames=( `jot -w n%d 15 0` )
+    backupDir=/mnt/ubin/QuorumNetworkManager
+    deploymentDir=/mnt/ubin/ubin-quorum
+    workDir=/mnt/ubin
+    archiveDir=~/xfer/archives
+    userName="sma05054"
+    domain=""
+    bastionHost="n11"
+}
+
+# create a tar ball by way of backup of the whole directory structure on all hosts.
+function do_backup_create {
+    local nx tarFile toDay
+    toDay=`date "+%Y-%m-%d_%H.%M"`
+    for nx
+    in $nodeNumbers
+    do
+        tarFile="/tmp/ubinlab_backup_${nx}_${toDay}.tar"
+        ssh ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} backup***\" ; \
+            set -x ; \
+            /bin/rm -rf /tmp/*.tar ; \
+            tar -cf $tarFile --exclude "*.ipc" * .npm; \
+        "
+    done
+}
+
+# configure the deployment node
+function do_config {
+    local src tgt files
+    src=ubin-quorum-setup/binaries/QuorumNetworkManager/networkNodesInfo.json
+    tgt=ubin-quorum/networkNodesInfo.json
+    scp -3 ${userName}@${machNames[$coordinator]}:$src ${userName}@${machNames[$deployment]}:$tgt
+    ssh ${userName}@${machNames[$deployment]} "\
+        echo \"***nx $deployment config***\" ; \
+        set -x  ; \
+        cd ubin-quorum ; \
+        file=convertConfig.js ; \
+        cp \$file \$file.original ; \
+        sed -e 's/\"quorumnx\"+nodeId+\".southeastasia.cloudapp.azure.com\"/\"ubin\"+nodeId+\".$domain\"/' <\$file.original >\$file ; \
+        node convertConfig.js ; \
+        file=start-api.sh ; \
+        cp \$file \$file.original ; \
+        sed -e 's/azureuser/$userName/' <\$file.original >\$file ; \
+        cd solc-local ; \
+        file=deploy_multi.js ; \
+        cp \$file \$file.original ; \
+        sed -e 's/\"quorumnx01.southeastasia.cloudapp.azure.com\"/\"${machNames[1]}.$domain\"/' <\$file.original >\$file ; \
+    "
+}
+
+# deploy the contracts
+function do_deploy {
+    ssh -t ${userName}@${machNames[$deployment]} "\
+        echo \"***nx $deployment deploy***\" ; \
+        cd ubin-quorum ; \
+        ./deploy.sh ; \
+    "
+}
+
+# test the contracts
+function do_initStash {
+    ssh -t ${userName}@${machNames[$deployment]} "\
+        echo \"***nx $deployment initStash***\" ; \
+        cd ubin-quorum/test-scripts ; \
+        ./initStash.sh 10 2000 3000 4000 5000 6000 7000 8000 9000 1000 1200 1400 1500 ; \
+    "
+}
+
+# generate the expect scripts for the coordinator and the non-coordinators
+# this assumes the mediuam size network.
+function do_expect {
+    local verify_src coordinator_src non_coordinator_src start_src start_tgt verify_src verify_tgt
+    verify_src=/tmp/ubin_expect_verify.sh
+    coordinator_src=/tmp/ubin_expect_coordinator.sh
+    non_coordinator_src=/tmp/ubin_expect_non_coordinator.sh
+
+    cat - <<'end' > $coordinator_src
+#!/usr/bin/expect
+set timeout 60
+eval spawn /usr/bin/node index.js
+
+# Please enter the IP address other nodes will use to connect to this node.
+# Also, please enter a publicly identifyable string for this node to use.
+expect "localIpAddress"    { send "NODE_IP\n" }
+expect "nodeName"    { send "NODE_NAME\n" }
+
+# Please select an option:
+# 1) Raft
+# 2) QuorumChain
+# 5) Kill all geth and constellation
+expect "option"    { send "1\n" }
+
+# Please select an option below:
+# ----- Option 1 and 2 are for the initial setup of a raft network -----
+# 1) Start a node as the setup coordinator [Ideally there should only be one coordinator]
+# 2) Start a node as a non-coordinator
+# ----- Option 3 is for joining a raft network post initial setup  -----
+# 3) Join a raft network if you were not part of the initial setup
+# 4) TODO: Start whisper services and attach to already running node
+# 5) killall geth constellation-node
+# 0) Quit
+expect "option"    { send "1\n" }
+
+# Please select an option below:
+# 1) Allow anyone to connect
+# 2) [TODO] Allow only people with pre-auth tokens to connect
+expect "option"    { send "1\n" }
+
+# Please select an option below:
+# 1) Clear all files/configuration and start from scratch[WARNING: this clears everything]
+# 2) Keep old files/configuration intact and start the node + whisper services
+expect "option"    { send "1\n" }
+
+# [*] Starting communication node...
+# [*] RPC connection established, Node started
+# Please wait for others to join. Hit any key + enter once done.
+end
+    jot -nb "expect \"has joined the network\"" $nodeJoins 1 >> $coordinator_src
+    cat - <<'end' >> $coordinator_src
+	{ send "continue\n" }
+
+expect "RPC connection established, Node started" { sleep 300 }
+# Please select an option below:
+# ----- Option 1 and 2 are for the initial setup of a raft network -----
+# 1) Start a node as the setup coordinator [Ideally there should only be one coordinator]
+# 2) Start a node as a non-coordinator
+# ----- Option 3 is for joining a raft network post initial setup  -----
+# 3) Join a raft network if you were not part of the initial setup
+# 4) TODO: Start whisper services and attach to already running node
+# 5) killall geth constellation-node
+# 0) Quit
+expect "option"    { send "0\n" }
+end
+
+    cat - <<'end' >$non_coordinator_src
+#!/usr/bin/expect
+set timeout 60
+eval spawn /usr/bin/node index.js
+
+# Please enter the IP address other nodes will use to connect to this node.
+# Also, please enter a publicly identifyable string for this node to use.
+expect "localIpAddress"    { send "NODE_IP\n" }
+expect "nodeName"    { send "NODE_NAME\n" }
+
+# Please select an option:
+# 1) Raft
+# 2) QuorumChain
+# 5) Kill all geth and constellation
+expect "option"    { send "1\n" }
+
+# Please select an option below:
+# ----- Option 1 and 2 are for the initial setup of a raft network -----
+# 1) Start a node as the setup coordinator [Ideally there should only be one coordinator]
+# 2) Start a node as a non-coordinator
+# ----- Option 3 is for joining a raft network post initial setup  -----
+# 3) Join a raft network if you were not part of the initial setup
+# 4) TODO: Start whisper services and attach to already running node
+# 5) killall geth constellation-node
+# 0) Quit
+expect "option"    { send "2\n" }
+
+# Please select an option below:
+# 1) Clear all files/configuration and start from scratch[WARNING: this clears everything]
+# 2) Keep old files/configuration intact and start the node + whisper services
+expect "option"    { send "1\n" }
+
+# In order to join the network, please enter the ip address of the coordinating node
+expect "ipAddress"    { send "COORDINATOR_IP\n" }
+
+expect "New node started" { sleep 300 }
+
+# Please select an option below:
+# ----- Option 1 and 2 are for the initial setup of a raft network -----
+# 1) Start a node as the setup coordinator [Ideally there should only be one coordinator]
+# 2) Start a node as a non-coordinator
+# ----- Option 3 is for joining a raft network post initial setup  -----
+# 3) Join a raft network if you were not part of the initial setup
+# 4) TODO: Start whisper services and attach to already running node
+# 5) killall geth constellation-node
+# 0) Quit
+expect "option"    { send "0\n" }
+
+# interact
+end
+
+    cat - <<'end' > $verify_src
+#!/usr/bin/expect
+set timeout 60
+
+eval spawn ./attachToLocalQuorumNode.sh
+
+expect ">"    { send "eth.accounts\n" }
+expect ">"    { send "eth.blockNumber\n" }
+expect "0"
+expect ">"    { send "txpool\n" }
+expect ">"    { send "admin.peers.length\n" }
+expect ">"    { send "raft\n" }
+expect ">"
+# interact
+end
+
+    for nx
+    in $nodeNumbers
+    do
+        start_src="/tmp/ubin_expect_start_${nx}.sh"
+        if [ $nx -eq $coordinator ] ; then
+            select_src="$coordinator_src"
+        else
+            select_src="$non_coordinator_src"
+        fi
+        sed -e "s/NODE_IP/$nodeIPhigh.${nodeIPlow[$nx]}/" \
+            -e "s/NODE_NAME/${nodeNames[$nx]}/" \
+            -e "s/COORDINATOR_IP/$nodeIPhigh.${nodeIPlow[$coordinator]}/" <$select_src >$start_src
+        start_tgt=ubin-quorum-setup/binaries/QuorumNetworkManager/`basename $start_src`
+        scp $start_src ${userName}@${machNames[$nx]}:$start_tgt
+        verify_tgt=ubin-quorum-setup/binaries/QuorumNetworkManager/`basename $verify_src`
+        scp $verify_src ${userName}@${machNames[$nx]}:$verify_tgt
+        ssh ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} expect***\" ; \
+            chmod +x $start_tgt $verify_tgt ; \
+            "
+    done
+}
+
+# update the ubin-quorum directory on the deployment node and make sure all node dependencies are installed
+function do_update {
+    ssh ${userName}@${machNames[$deployment]} "\
+        echo \"***nx ${deployment} update***\" ; \
+        set -x ; \
+        /bin/rm -rf ubin-quorum ; \
+	git clone https://github.com/pieterhartel/ubin-quorum ; \
+        cd ubin-quorum  ; \
+        npm install ; \
+        "
+}
+
+# install the necessary software on the nodes
+function do_install {
+    local nx file
+    for nx
+    in $nodeNumbers
+    do
+        file="/tmp/ubin_install_${nx}.sh"
+        echo "ssh -t ${userName}@${machNames[$nx]} \"
+            sudo apt update ; \
+            sudo apt upgrade ; \
+            sudo apt install -y curl ; \
+            curl -sL https://deb.nodesource.com/setup_8.x | sudo -E bash - ; \
+            sudo apt install -y nodejs ; \
+            npm -v ; \
+            node -v ; \
+            sudo apt install -y software-properties-common python-software-properties ; \
+            sudo add-apt-repository ppa:webupd8team/java ; \
+            sudo apt update ; \
+            sudo apt install -y oracle-java8-installer git psmisc screen expect jq ; \
+            javac -version ; \
+            java -version ; \
+            git clone https://github.com/project-ubin/ubin-quorum.git ; \
+            git clone https://github.com/project-ubin/ubin-quorum-setup.git ; \
+            cd ubin-quorum-setup/binaries/setup/ ; \
+            ./cleanup_process.sh ; \
+            . ./setup_full.sh ; \
+            sudo npm install -g truffle ; \
+        \" " > $file
+        chmod +x $file
+        open -a Terminal.app $file
+    done
+}
+
+# start logging the geth client on the coordinator node
+function do_log {
+    local nx file
+    for nx
+    in $coordinator 
+    do
+        file="/tmp/ubin_log_$nx.sh"
+        echo "ssh ${userName}@${machNames[$nx]} \"
+            echo \"***nx $nx log***\" ; \
+            tail -f ubin-quorum-setup/binaries/QuorumNetworkManager/gethNode.log ; \
+            \"" > $file
+        chmod +x $file
+        open -a Terminal.app $file
+    done
+}
+
+# make sure that all files in the home directory of $userName are owned by $userName
+function do_owner {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        ssh -t ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} owner***\" ; \
+            sudo chown -Rv $userName:$userName * ; \
+            "
+    done
+}
+
+# ping the hosts
+function do_ping {
+    local nx
+    #set -x
+    for nx
+    in $nodeNumbers
+    do
+        if [ -n "$domain" ]; then
+            ping -c 1 ${machNames[$nx]}.$domain
+        else
+            ping -c 1 ${machNames[$nx]}
+        fi
+    done
+}
+
+# check which processes are running on the hosts
+function do_ps {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        ssh ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} ps***\" ; \
+            ps uax | grep -e node -e geth -e constellation ; \
+            "
+    done
+}
+
+# reboot the hosts. Best to stop all processes first. UNTESTED!!
+function do_reboot {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        ssh -t ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} reboot***\" ; \
+            sudo reboot ; \
+        "
+    done
+}
+
+# remove all files in the home directoty of ecah machine.
+function do_remove_all {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        ssh -t ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} remove_all***\" ; \
+            /bin/rm -rf * .npm ; \
+        "
+    done
+}
+
+# ensure that scripts can login to the nodes's by typing the passwords just once.
+function do_sshkeys {
+    local nx
+    set -x
+    for nx
+    in $nodeNumbers
+    do
+        cat $HOME/.ssh/id_rsa.pub |\
+        ssh ${userName}@${machNames[$nx]} 'mkdir -m700 -p .ssh; cat > .ssh/authorized_keys'
+    done
+}
+
+# Generate an ~/.ssh/config script to tunnel through a bastion host
+function do_sshconfig {
+    local nx
+    FILE=$HOME/.ssh/config
+    if [ -f $FILE ] ; then
+        echo "$FILE already exists."
+    else
+        cp /dev/null $FILE
+        for nx
+        in $nodeNumbers
+        do
+            cat - <<end >>$FILE
+Host ${machNames[$nx]}
+	Hostname %h.${domain}
+	ProxyCommand ssh ${userName}@${bastionHost} -W %h:%p
+	User ${userName}
+end
+        done
+    fi
+}
+
+# stop all nodes, including the deployment node
+function do_stop {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        ssh ${userName}@${machNames[$nx]} "\
+            echo \"***nx ${nx} stop***\" ; \
+            killall node ; \
+            cd ubin-quorum-setup/binaries/setup ; \
+            ./cleanup_process.sh ; \
+            "
+    done
+}
+
+# start all nodes, except the deployment node
+function do_start {
+    local nx file
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -ne $deployment ] ; then
+            file="/tmp/ubin_start_${nx}.sh"
+            echo "ssh ${userName}@${machNames[$nx]} \"
+                echo \"***nx ${nx} start***\" ; \
+                export PATH=\\\$PATH:/home/phartel/ubin-quorum-setup/binaries/constellation/ubuntu1604 ; \
+                cd ubin-quorum-setup/binaries/QuorumNetworkManager/ ; \
+                ps uax | grep -e hartel -e bash -e node -e geth -e consensus ; \
+                ./ubin_expect_start_${nx}.sh ; \
+                ps uax | grep -e hartel -e bash -e node -e geth -e consensus ; \
+                ./ubin_expect_verify.sh ; \
+                \"" > $file
+            chmod +x $file
+            open -a Terminal.app $file
+        fi
+    done
+}
+
+# create a tar ball by way of backup of the whole directory structure on all nodes
+function do_backup {
+    local nx tarFile toDay
+    toDay=`date "+%Y-%m-%d_%H.%M"`
+
+    for nx
+    in $nodeNumbers
+    do
+        tarFile="ubinlab_backup_${nx}_${toDay}.tar"
+        if [ $nx -ne $deployment ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+                echo \"***Node ${nx} backup***\" ; \
+                set -x ; \
+                rm $workDir/ubinlab_backup*.tar ; \
+                tar -zcf $workDir/$tarFile $workDir; \
+                rm $archiveDir/ubinlab_backup_${nx}_*.tar ; \
+                cp $workDir/$tarFile $archiveDir ; \
+            "
+        fi
+        if [ $nx -eq $deployment ] ; then
+             ssh ${userName}@${machNames[$nx]} "\
+                echo \"***Deployment ${nx} backup***\" ; \
+                set -x ; \
+                rm $workDir/ubinlab_backup*.tar ; \
+                tar -zcf $workDir/$tarFile $workDir; \
+                rm $archiveDir/ubinlab_backup_${nx}_*.tar ; \
+                cp $workDir/$tarFile $archiveDir ; \
+            "
+        fi
+    done
+}
+
+# remove log files, except for deployment node.
+function do_removelogs {
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -ne $deployment ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+                echo \"***Node ${nx} remove log**\" ; \
+                set -x ; \
+                rm $workDir/QuorumNetworkManager/*.log ; \
+            "
+        fi
+    done
+}
+
+# tail last n lines of geth logs, except for deployment node.
+function do_taillogs {
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -ne $deployment ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+                echo \"***Node ${nx} log***\" ; \
+                set -x ; \
+                tail -n 10 $workDir/QuorumNetworkManager/gethNode.log ; \
+            "
+        fi
+    done
+}
+
+# stop all ncl nodes, except the deployment node
+function do_stop_ncl {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -ne $deployment ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+            echo \"***NCL n ${nx} stop***\" ; \
+            killall node ; \
+            cd $workDir/QuorumNetworkManager ; \
+            ./stopUbin.sh ; \
+            "
+        fi
+    done
+}
+
+# start all nodes, except the deployment node
+function do_start_ncl {
+    local nx file
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -ne $deployment ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+            echo \"***NCL n ${nx} start***\" ; \
+            killall node ; \
+            cd $workDir/QuorumNetworkManager ; \
+            ./startUbin.sh ; \
+            "
+            # no new shell window for now
+            #open -a Terminal.app $file
+        fi
+    done
+}
+
+# stop an individual node #1
+function do_stop_node {
+    if [ $# -eq 0 ] ; then
+        echo "Error - missing node number argument."
+        exit 1
+    fi
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -eq $1 ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+            echo \"***Stopping node n${nx}***\" ; \
+            killall node ; \
+            cd $workDir/QuorumNetworkManager ; \
+            ./stopUbin.sh ; \
+            "
+            exit 0
+        fi
+    done
+}
+
+# start an individual node #1
+function do_start_node {
+    if [ $# -eq 0 ] ; then
+        echo "Error - missing node number argument."
+        exit 1
+    fi
+    local nx file
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -eq $1 ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+            echo \"***Starting node n${nx}***\" ; \
+            killall node ; \
+            cd $workDir/QuorumNetworkManager ; \
+            ./startUbin.sh ; \
+            "
+            exit 0
+        fi
+    done
+}
+
+# stop apiservers in all nodes, except the deployment node
+function do_stop_apiservers {
+    local nx
+    for nx
+    in $nodeNumbers
+    do
+        if [ $nx -ne $deployment ] ; then
+            ssh ${userName}@${machNames[$nx]} "\
+            echo \"***Stopping APIserver in n${nx}***\" ; \
+            killall node ; \
+            "
+        fi
+    done
+}
+
+function usageNCL {
+    echo "usage: [ ubinlab_ncl ]"
+    echo "           [ start | stop | startnode <number> | stopnode <number> | "
+    echo "             stop_apiservers | backup | "
+    echo "             removelogs | ping | ps | sshconfig | sshkeys | taillogs ]"
+}
+
+# main for NCL specific options
+function do_main_ncl {
+    if [ $# -eq 0 ] ; then
+        usageNCL
+        exit 1;
+    fi
+
+    do_medium_ncl
+    case $1 in
+backup)     do_backup ;;
+removelogs) do_removelogs ;;
+owner)      do_owner ;;
+ping)       do_ping ;;
+ps)         do_ps ;;
+sshconfig)  do_sshconfig ;;
+sshkeys)    do_sshkeys ;;
+taillogs)   do_taillogs ;;
+start)      do_start_ncl ;;
+stop)       do_stop_ncl ;;
+startnode)
+    if [ $# -ne 2 ] ; then
+        echo "Error - node number must be provided"
+        exit 1;
+    fi
+    do_start_node $2
+    ;;
+stopnode)
+    if [ $# -ne 2 ] ; then
+        echo "Error - node number must be provided"
+        exit 1;
+    fi
+    do_stop_node $2
+    ;;
+stop_apiservers) do_stop_apiservers ;;
+*)          usageNCL ;;
+    esac
+}
+
+function usage {
+    echo "usage: [ ubinlab_small | ubinlab_medium ]"
+    echo "           [ start | stop |"
+    echo "             backup | remove | "
+    echo "             update | "
+    echo "             config | deploy | expect | install | initStash | log | ping | ps | reboot | sshconfig | sshkeys | "
+}
+
+
+# ubinlab_ncl
+if [[ "$0" == *ncl ]]
+then
+    do_main_ncl "$@"
+    exit 0;
+fi
+
+# ubinlab_small | ubinlab_medium
+if [ $# -eq 0 ]; then
+    usage
+    exit 1;
+else
+    case $0 in
+*small)    do_small ;;
+*)         do_medium_tudelft ;;
+    esac
+
+    case $1 in
+backup)    do_backup_create ;;
+config)    do_config ;;
+deploy)    do_deploy ;;
+expect)    do_expect ;;
+install)   do_install ;;
+initStash) do_initStash ;;
+log)       do_log ;;
+owner)     do_owner ;;
+ping)      do_ping ;;
+ps)        do_ps ;;
+reboot)    do_reboot ;;
+remove_all)do_remove_all ;;
+sshconfig) do_sshconfig ;;
+sshkeys)   do_sshkeys ;;
+start)     do_start ;;
+stop)      do_stop ;;
+update)    do_update ;;
+*)         usage ;;
+    esac
+fi
